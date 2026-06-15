@@ -152,6 +152,21 @@ async function getSpotifyId(title, artist, auth) {
 
 // --- Main API Handler ---
 export default async function handler(req, res) {
+    // --- CORS Configuration Setup ---
+    res.setHeader('Access-Control-Allow-Credentials', true);
+    res.setHeader('Access-Control-Allow-Origin', '*'); // Adjust '*' to your specific domain if needed for strict security
+    res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
+    res.setHeader(
+        'Access-Control-Allow-Headers',
+        'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version'
+    );
+
+    // Handle Preflight (OPTIONS) Request for CORS
+    if (req.method === 'OPTIONS') {
+        res.status(200).end();
+        return;
+    }
+
     const { seo, limit } = req.query;
 
     if (!seo) {

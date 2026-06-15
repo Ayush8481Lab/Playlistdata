@@ -2,15 +2,27 @@
 
 // Allow longer execution time on Vercel (Hobby max is 10s, Pro is 300s)
 export const config = {
-    maxDuration: 60, 
+    maxDuration: 60,
 };
+
+// --- VERCEL PROTECTION BYPASS ---
+const AUTOMATION_SECRET = "pR3nSUsTI9HQxb2RbdasB5mjKqUoSP8m";
+const bypassHeaders = { "x-vercel-protection-bypass": AUTOMATION_SECRET };
 
 // --- Helper: Decode Entities ---
-const decodeEntities = (str) => {
-    return (str || "").replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#039;/g, "'");
+const decodeEntities = (text) => {
+    if (!text) return "";
+    return text
+        .replace(/&amp;/g, "&")
+        .replace(/&quot;/g, '"')
+        .replace(/&#039;/g, "'")
+        .replace(/&#39;/g, "'")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&apos;/g, "'");
 };
 
-// --- Helper: Process items in chunks to avoid rate limits/timeouts ---
+// --- Helper: Process items in chunks to avoid server overloads ---
 async function processInChunks(items, fn, chunkSize = 15) {
     const results = [];
     for (let i = 0; i < items.length; i += chunkSize) {
@@ -21,17 +33,41 @@ async function processInChunks(items, fn, chunkSize = 15) {
     return results;
 }
 
+// --- Helper: Fetch Pro Auth Token once per request ---
+async function getAuthData() {
+    try {
+        const res = await fetch('https://serverayush.vercel.app/api/auth', {
+            headers: { ...bypassHeaders }
+        });
+        if (!res.ok) return null;
+        const data = await res.json();
+        // Fallback for jina wrapper just in case the API returns wrapped data
+        if (data && data.data && data.data.content) {
+            const match = data.data.content.match(/```(?:json)?\n([\s\S]*?)\n```/);
+            return match ? JSON.parse(match[1]) : JSON.parse(data.data.content);
+        }
+        return data;
+    } catch (e) {
+        console.error("Failed to fetch Auth Token:", e);
+        return null;
+    }
+}
+
 // --- Helper: Fetch Track Info (Genre, Year, Composer, Release Date) ---
 async function getTrackDetails(trackId) {
     try {
-        const res = await fetch(`https://apiv2.gaana.com/track/info?track_id=${trackId}`);
+        // You can use apiv2.gaana.com or your superserch endpoint if apiv2 blocks Vercel IPs
+        const res = await fetch(`https://gaanaayush.vercel.app/api/superserch/track/info?track_id=${trackId}`, {
+            headers: { ...bypassHeaders }
+        });
         if (!res.ok) return {};
-        const data = await res.json();
-        
+        const json = await res.json();
+        const data = json.data || json;
+
         const genre = data.tags && data.tags.length > 0 ? data.tags[0].tag_name : "";
         const release_date = data.release_date || "";
         const year = release_date ? release_date.split("-")[0] : "";
-        const composers = data.composers ? data.composers.map(c => c.name).join(", ") : "";
+        const composers = data.composers ? data.composers.map((c) => c.name).join(", ") : "";
 
         return { genre, release_date, year, composers };
     } catch (e) {
@@ -39,63 +75,76 @@ async function getTrackDetails(trackId) {
     }
 }
 
-// --- Helper: Spotify Matching Algorithm (Adapted from Player) ---
-async function getSpotifyId(title, artist) {
-    const RAPID_KEYS = [
-        "d1edce158amshec139440d20658ap1f2545jsnbb7da9add82f",
-        "6cf7f03014msh787c51a713c0264p15c20djsna1f9a9f6a378",
-        "13d48f6bb8msh459c11b91bdcc44p110f4ejsn099443894115",
-        "03fc23317fmsh0535ef9ec8c6f5bp1db59bjsn545991df9343"
-    ];
-    // Randomize keys to avoid hitting limits
-    const key = RAPID_KEYS[Math.floor(Math.random() * RAPID_KEYS.length)];
+// --- Helper: AK47 Matching Algorithm (From your Player code) ---
+const performAK47Matching = (results, targetTrack, targetArtist) => {
+    if (!results || results.length === 0) return null;
+    const clean = (s) => decodeEntities(s || "").toLowerCase().replace(/[^\w\s]|_/g, "").replace(/\s+/g, " ").trim();
+    const tTitle = clean(targetTrack);
+    const tArtist = clean(targetArtist);
+    let bestMatch = null;
+    let highestScore = 0;
+
+    results.forEach((track) => {
+        if (!track) return;
+        const rTitle = clean(track.song_name);
+        const rArtists = clean(track.artist);
+        let score = 0;
+        let artistMatched = false;
+
+        if (tArtist.length > 0) {
+            if (rArtists === tArtist) { score += 100; artistMatched = true; }
+            else if (rArtists.includes(tArtist) || tArtist.includes(rArtists)) { score += 80; artistMatched = true; }
+            else {
+                const tSplit = tArtist.split(" ");
+                for (let t of tSplit) { 
+                    if (t.length > 2 && rArtists.includes(t)) { score += 50; artistMatched = true; break; } 
+                }
+            }
+            if (!artistMatched) score = 0;
+        } else score += 50;
+
+        if (score > 0) {
+            if (rTitle === tTitle) score += 100;
+            else if (rTitle.startsWith(tTitle) || tTitle.startsWith(rTitle)) score += 80;
+            else if (rTitle.includes(tTitle) || tTitle.includes(rTitle)) score += 50;
+        }
+        
+        if (score > highestScore) { 
+            highestScore = score; 
+            bestMatch = track; 
+        }
+    });
+    
+    if (highestScore > 0) return bestMatch;
+    return results[0]; // Fallback to first result if no strong match
+};
+
+// --- Helper: Search Spotify ID using Custom AK47 API ---
+async function getSpotifyId(title, artist, auth) {
+    if (!auth || !auth.accessToken) return null;
+
     const query = `${title} ${artist}`.trim();
-    const searchUrl = `https://spotify81.p.rapidapi.com/search?q=${encodeURIComponent(query)}&type=tracks&offset=0&limit=10&numberOfTopResults=5`;
+    const searchUrl = `https://ak47ayush.vercel.app/search?q=${encodeURIComponent(query)}&CID=${auth.clientId}&token=${auth.accessToken}&limit=15&offset=0`;
 
     try {
         const res = await fetch(searchUrl, {
-            headers: { 'x-rapidapi-key': key, 'x-rapidapi-host': 'spotify81.p.rapidapi.com' }
+            headers: { ...bypassHeaders }
         });
         if (!res.ok) return null;
+
+        const authJson = await res.json();
         
-        const matchData = await res.json();
-        const clean = (s) => decodeEntities(s || "").toLowerCase().replace(/[^\w\s]|_/g, "").replace(/\s+/g, " ").trim();
-        
-        const tTitle = clean(title);
-        const tArtist = clean(artist);
-        let bestMatch = null;
-        let highestScore = 0;
-
-        if (matchData.tracks) {
-            matchData.tracks.forEach((item) => {
-                const track = item.data || item;
-                if (!track) return;
-                const rTitle = clean(track.name);
-                const rArtists = (track.artists?.items || track.artists || []).map(a => clean(a.profile?.name || a.name));
-
-                let score = 0;
-                let artistMatched = false;
-                
-                if (tArtist.length > 0) {
-                    for (let ra of rArtists) {
-                        if (ra === tArtist) { score += 100; artistMatched = true; break; }
-                        else if (ra.includes(tArtist) || tArtist.includes(ra)) { score += 80; artistMatched = true; break; }
-                    }
-                    if (!artistMatched) score = 0;
-                } else {
-                    score += 50;
-                }
-
-                if (score > 0) {
-                    if (rTitle === tTitle) score += 100;
-                    else if (rTitle.startsWith(tTitle) || tTitle.startsWith(rTitle)) score += 80;
-                    else if (rTitle.includes(tTitle)) score += 50;
-                }
-
-                if (score > highestScore) { highestScore = score; bestMatch = track; }
-            });
+        if (authJson && authJson.results && Array.isArray(authJson.results) && authJson.results.length > 0) {
+            const match = performAK47Matching(authJson.results, title, artist);
+            if (match) {
+                // Extract ID safely based on your AK47 API response structure
+                const sId = match.id || 
+                            (match.spotify_url && match.spotify_url.split('/track/')[1]?.split('?')[0]) || 
+                            (match.external_urls?.spotify?.split('/track/')[1]?.split('?')[0]);
+                return sId || null;
+            }
         }
-        return bestMatch ? bestMatch.id : null;
+        return null;
     } catch (e) {
         return null;
     }
@@ -106,38 +155,43 @@ export default async function handler(req, res) {
     const { seo, limit } = req.query;
 
     if (!seo) {
-        return res.status(400).json({ error: "Missing 'seo' query parameter" });
+        return res.status(400).json({ error: "Missing 'seo' query parameter. Example: ?seo=gaana-dj-international-weekly-hot-20" });
     }
 
     try {
-        // 1. Fetch original Playlist from Gaana
-        const playlistRes = await fetch(`https://gaanaayush.vercel.app/api/playlists/${seo}`);
+        // 1. Fetch Playlist from Gaana using Bypass Header
+        const playlistRes = await fetch(`https://gaanaayush.vercel.app/api/playlists/${seo}`, {
+            headers: { ...bypassHeaders }
+        });
         const playlistJson = await playlistRes.json();
 
         if (!playlistJson.data?.data?.playlist) {
-            return res.status(404).json({ error: "Playlist not found" });
+            return res.status(404).json({ error: "Playlist not found or blocked by protection." });
         }
 
         const originalPlaylist = playlistJson.data.data.playlist;
         let originalTracks = originalPlaylist.tracks || [];
-        
-        // Optional: Cut track length via query ?limit=20 to prevent Vercel Timeout
+
+        // Optional: Slice tracks to avoid Vercel timeout limits
         if (limit) {
             originalTracks = originalTracks.slice(0, parseInt(limit));
         }
 
-        // 2. Process all tracks concurrently in chunks
+        // 2. Pre-fetch Auth Token once so we don't spam the Auth API for every single track
+        const authData = await getAuthData();
+
+        // 3. Process Tracks Concurrently in chunks (to respect API limits)
         const processedTracks = await processInChunks(originalTracks, async (track) => {
-            // First Artist to use for Spotify Search
-            const firstArtist = track.artists ? track.artists.split(',')[0].trim() : "";
-            
-            // Parallel fetch Gaana Track Info & Spotify Match
+            // Pick primary artist for higher accuracy in AK47 matching
+            const firstArtist = track.artists ? track.artists.split(',').slice(0, 2).join(' ') : "";
+            const cleanTitle = decodeEntities(track.title);
+
+            // Parallel execution: Get Extended Info + Spotify ID Match
             const [details, spotifyId] = await Promise.all([
                 getTrackDetails(track.track_id),
-                getSpotifyId(track.title, firstArtist)
+                getSpotifyId(cleanTitle, firstArtist, authData)
             ]);
 
-            // Construct new clean Track object
             return {
                 seokey: track.seokey,
                 track_id: track.track_id,
@@ -150,15 +204,15 @@ export default async function handler(req, res) {
                 artist_seokeys: track.artist_seokeys,
                 artist_ids: track.artist_ids,
                 artworkUrl: track.artworkUrl,
-                genre: details.genre || "",
-                year: details.year || "",
-                release_date: details.release_date || "",
-                composers: details.composers || "",
+                genre: details.genre,
+                year: details.year,
+                release_date: details.release_date,
+                composers: details.composers,
                 spotify_id: spotifyId || ""
             };
         });
 
-        // 3. Construct Final Payload Output
+        // 4. Construct Final Response Payload
         const finalResponse = {
             success: true,
             data: {
@@ -180,22 +234,22 @@ export default async function handler(req, res) {
                         tracks: processedTracks
                     }
                 },
-                meta: playlistJson.data.meta
+                meta: playlistJson.data.meta || {}
             },
             meta: {
-                project: "Gaana Extended Playlist API",
-                version: "2.0.0",
+                project: "Gaana Pro Playlist API",
+                version: "3.0.0",
                 author: "Ayush Kumaryadav",
                 timestamp: new Date().toISOString()
             }
         };
 
-        // Send Response
+        // Send Success
         res.setHeader('Content-Type', 'application/json');
         res.status(200).send(JSON.stringify(finalResponse, null, 2));
 
     } catch (error) {
-        console.error("API Error:", error);
+        console.error("API Server Error:", error);
         res.status(500).json({ error: "Internal Server Error" });
     }
 }
